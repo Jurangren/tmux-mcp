@@ -26,6 +26,13 @@ export interface TmuxPane {
   title: string;
 }
 
+export interface CapturePaneResult {
+  content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+}
+
 interface CommandExecution {
   id: string;
   paneId: string;
@@ -149,11 +156,45 @@ export async function listPanes(windowId: string): Promise<TmuxPane[]> {
 }
 
 /**
- * Capture content from a specific pane, by default the latest 200 lines.
+ * Get the total number of lines in a pane's history.
  */
-export async function capturePaneContent(paneId: string, lines: number = 200, includeColors: boolean = false): Promise<string> {
+export async function getPaneSize(paneId: string): Promise<number> {
+  const output = await executeTmux(`capture-pane -p -t '${paneId}' -S -`);
+  // Fallback to 0 if output is empty
+  return output ? output.split('\n').length : 0;
+}
+
+/**
+ * Capture content from a specific pane.
+ */
+export async function capturePaneContent(
+  paneId: string,
+  lines: number = 100,
+  includeColors: boolean = false
+): Promise<CapturePaneResult> {
   const colorFlag = includeColors ? '-e' : '';
-  return executeTmux(`capture-pane -p ${colorFlag} -t '${paneId}' -S -${lines} -E -`);
+  const allContent = await executeTmux(`capture-pane -p ${colorFlag} -t '${paneId}' -S -`);
+  const allLines = allContent.split('\n');
+  const totalLines = allLines.length;
+
+  let startLine: number;
+  let endLine: number;
+  let contentLines: string[];
+
+  if (lines === 0) {
+    // Capture all lines
+    startLine = 0;
+    endLine = totalLines;
+    contentLines = allLines;
+  } else {
+    // Capture the last 'lines' number of lines
+    startLine = Math.max(0, totalLines - lines);
+    endLine = totalLines;
+    contentLines = allLines.slice(startLine);
+  }
+
+  const content = contentLines.join('\n');
+  return { content, startLine, endLine, totalLines };
 }
 
 /**
@@ -236,8 +277,8 @@ export async function splitPane(
 // Map to track ongoing command executions
 const activeCommands = new Map<string, CommandExecution>();
 
-const startMarkerText = 'TMUX_MCP_START';
-const endMarkerPrefix = "TMUX_MCP_DONE_";
+const baseStartMarker = 'TMUX_MCP_START';
+const baseEndMarker = "TMUX_MCP_DONE";
 
 // Execute a command in a tmux pane and track its execution
 export async function executeCommand(paneId: string, command: string, rawMode?: boolean, noEnter?: boolean): Promise<string> {
@@ -248,8 +289,9 @@ export async function executeCommand(paneId: string, command: string, rawMode?: 
   if (rawMode || noEnter) {
     fullCommand = command;
   } else {
-    const endMarkerText = getEndMarkerText();
-    fullCommand = `echo "${startMarkerText}"; ${command}; echo "${endMarkerText}"`;
+    const startMarker = `${baseStartMarker}_${commandId}`;
+    const endMarker = getEndMarkerText(commandId);
+    fullCommand = `echo "${startMarker}"; ${command}; echo "${endMarker}"`;
   }
 
   // Store command in tracking map
@@ -293,15 +335,19 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
 
   if (command.status !== 'pending') return command;
 
-  const content = await capturePaneContent(command.paneId, 1000);
+  const captureResult = await capturePaneContent(command.paneId, 1000);
+  const content = captureResult.content;
 
   if (command.rawMode) {
     command.result = 'Status tracking unavailable for rawMode commands. Use capture-pane to monitor interactive apps instead.';
     return command;
   }
 
-  // Find the last occurrence of the markers
-  const startIndex = content.lastIndexOf(startMarkerText);
+  const startMarker = `${baseStartMarker}_${commandId}`;
+  const endMarkerPrefix = `${baseEndMarker}_${commandId}_`;
+
+  // Find the last occurrence of the markers for this specific command
+  const startIndex = content.lastIndexOf(startMarker);
   const endIndex = content.lastIndexOf(endMarkerPrefix);
 
   if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
@@ -321,10 +367,10 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
     command.exitCode = exitCode;
 
     // Extract output between the start and end markers
-    const outputStart = startIndex + startMarkerText.length;
+    const outputStart = startIndex + startMarker.length;
     const outputContent = content.substring(outputStart, endIndex).trim();
 
-    command.result = outputContent.substring(outputContent.indexOf('\n') + 1).trim();
+    command.result = outputContent.trim();
 
     // Update in map
     activeCommands.set(commandId, command);
@@ -356,9 +402,55 @@ export function cleanupOldCommands(maxAgeMinutes: number = 60): void {
   }
 }
 
-function getEndMarkerText(): string {
+function getEndMarkerText(commandId: string): string {
+  const endMarkerPrefix = `${baseEndMarker}_${commandId}_`;
   return shellConfig.type === 'fish'
     ? `${endMarkerPrefix}$status`
     : `${endMarkerPrefix}$?`;
 }
 
+/**
+ * Capture a specific range of lines from a pane.
+ */
+export async function capturePaneContentByLines(
+  paneId: string,
+  start: number,
+  end: number,
+  includeColors: boolean = false
+): Promise<CapturePaneResult> {
+  const colorFlag = includeColors ? '-e' : '';
+  const allContent = await executeTmux(`capture-pane -p ${colorFlag} -t '${paneId}' -S -`);
+  const allLines = allContent.split('\n');
+  const totalLines = allLines.length;
+
+  // Adjust for negative indices
+  const finalStart = start < 0 ? totalLines + start : start;
+  const finalEnd = end < 0 ? totalLines + end : end;
+
+  const contentLines = allLines.slice(finalStart, finalEnd);
+  const content = contentLines.join('\n');
+
+  return { content, startLine: finalStart, endLine: finalEnd, totalLines };
+}
+
+/**
+ * Get the currently active pane in the attached session.
+ */
+export async function getActivePane(): Promise<TmuxPane | null> {
+  const sessions = await listSessions();
+  const activeSession = sessions.find(s => s.attached);
+
+  if (!activeSession) {
+    return null;
+  }
+
+  const windows = await listWindows(activeSession.id);
+  const activeWindow = windows.find(w => w.active);
+
+  if (!activeWindow) {
+    return null;
+  }
+
+  const panes = await listPanes(activeWindow.id);
+  return panes.find(p => p.active) || null;
+}
